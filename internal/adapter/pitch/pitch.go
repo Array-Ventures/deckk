@@ -2,7 +2,6 @@ package pitch
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"net/url"
 	"os"
@@ -135,19 +134,14 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		return nil, fmt.Errorf("could not find slide player on the page")
 	}
 
-	// The counter is authoritative for how many slides to expect; if it's
-	// missing (markup change), fall back to a generous cap and rely on the
-	// hash-repeat stop to find the end.
+	// Require a known total; repeated screenshots do not prove end of deck.
 	maxSlides := det.Total
-	if maxSlides == 0 {
-		maxSlides = 200
-		fmt.Fprintf(os.Stderr, "no slide counter found; walking until the deck repeats\n")
-	} else {
-		fmt.Fprintf(os.Stderr, "deck has %d slide(s)\n", maxSlides)
+	if maxSlides <= 0 {
+		return nil, fmt.Errorf("could not determine Pitch slide count; no partial PDF was saved")
 	}
+	fmt.Fprintf(os.Stderr, "deck has %d slide(s)\n", maxSlides)
 
 	var slides []adapter.Slide
-	var lastHash [32]byte
 	for i := 1; i <= maxSlides; i++ {
 		if i > 1 {
 			if err := chromedp.Run(bctx, chromedp.KeyEvent(kb.ArrowRight)); err != nil {
@@ -161,44 +155,15 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 			return nil, err
 		}
 
-		rect, err := findSlide(bctx)
+		rect, err := waitForSlide(bctx, i, maxSlides)
 		if err != nil {
 			return nil, err
-		}
-		if rect == nil {
-			fmt.Fprintf(os.Stderr, "slide %d vanished; stopping\n", i)
-			break
 		}
 
 		shot, err := captureViewportClip(bctx, viewportRect{X: rect.X, Y: rect.Y, W: rect.W, H: rect.H})
 		if err != nil {
 			return nil, fmt.Errorf("screenshot slide %d: %w", i, err)
 		}
-		h := sha256.Sum256(shot)
-		if i > 1 && h == lastHash {
-			// ArrowRight didn't change the rendered slide. Could be a slow
-			// transition or we're past the end of the deck — give it one
-			// more beat before deciding.
-			if err := chromedp.Run(bctx, chromedp.Sleep(1500*time.Millisecond)); err != nil {
-				return nil, err
-			}
-			rect, err = findSlide(bctx)
-			if err != nil {
-				return nil, err
-			}
-			if rect != nil {
-				shot, err = captureViewportClip(bctx, viewportRect{X: rect.X, Y: rect.Y, W: rect.W, H: rect.H})
-				if err != nil {
-					return nil, fmt.Errorf("screenshot slide %d: %w", i, err)
-				}
-				h = sha256.Sum256(shot)
-			}
-			if rect == nil || h == lastHash {
-				fmt.Fprintf(os.Stderr, "end of deck after %d slide(s)\n", len(slides))
-				break
-			}
-		}
-		lastHash = h
 		slides = append(slides, adapter.Slide{Data: shot, ContentType: "image/png"})
 	}
 
@@ -206,6 +171,25 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		return nil, fmt.Errorf("no slides captured")
 	}
 	return slides, nil
+}
+
+func waitForSlide(ctx context.Context, current, total int) (*slideInfo, error) {
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		info, err := findSlide(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if info != nil && info.Current == current && info.Total == total {
+			return info, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("Pitch did not display slide %d of %d; no partial PDF was saved", current, total)
+		}
+		if err := chromedp.Run(ctx, chromedp.Sleep(100*time.Millisecond)); err != nil {
+			return nil, err
+		}
+	}
 }
 
 // slideInfo is the parsed result of findSlideJS.

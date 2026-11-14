@@ -149,7 +149,9 @@ sessions or return structured JSON.
 - **pitch** — handles `pitch.com/v/...` decks. Loads the public player,
   reads the slide counter, then walks through each slide with the arrow key
   and screenshots just the slide into a PDF. Only works for publicly shared
-  player links.
+  player links. Requires a known slide count, confirms each page before
+  capture, and retains intentional duplicate slides. Failed navigation stops
+  the export without returning a partial deck.
 
 - **pdf** — the fallback for any `http(s)` URL no other adapter claims. If
   the URL serves a PDF, `deckk` saves it as-is. It matches on scheme rather

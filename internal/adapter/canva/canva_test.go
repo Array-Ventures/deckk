@@ -61,21 +61,23 @@ footer{position:absolute;top:900px}</style>
 }
 
 func TestCompleteCaptureAndStuckPage(t *testing.T) {
-	for _, stuck := range []bool{false, true} {
-		t.Run(fmt.Sprintf("stuck=%t", stuck), func(t *testing.T) {
+	for _, mode := range []string{"complete", "stuck", "start-late"} {
+		t.Run(mode, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				fmt.Fprintf(w, `<!doctype html><style>body{margin:0}[role=presentation]{position:absolute;left:24px;top:80px;width:640px;height:360px}footer{position:absolute;top:900px}</style>
 <div role="presentation" data-page-id="0"><svg width="640" height="360"><rect width="640" height="360" fill="blue"/></svg></div>
 <footer><button id="count"></button><button aria-label="Present full screen">Present</button></footer>
-<script>setTimeout(()=>document.querySelector('#count').textContent='1 / 2',5200);
-document.onkeydown=e=>{if(e.key==='ArrowRight' && !%t){document.querySelector('#count').textContent='';document.querySelector('[data-page-id]').dataset.pageId='1'}}</script>`, stuck)
+<script>const mode=%q;
+if(mode==='start-late')document.querySelector('[data-page-id]').dataset.pageId='1';
+setTimeout(()=>document.querySelector('#count').textContent='1 / 2',5200);
+document.onkeydown=e=>{if(e.key==='ArrowRight' && mode!=='stuck'){document.querySelector('#count').textContent='';document.querySelector('[data-page-id]').dataset.pageId='1'}}</script>`, mode)
 			}))
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
 			defer cancel()
 			slides, err := (&Adapter{}).Fetch(ctx, server.URL, adapter.Options{})
-			if stuck {
+			if mode != "complete" {
 				if err == nil || !strings.Contains(err.Error(), "stuck") || len(slides) != 0 {
 					t.Fatalf("partial deck returned: slides=%d err=%v", len(slides), err)
 				}
@@ -94,5 +96,32 @@ document.onkeydown=e=>{if(e.key==='ArrowRight' && !%t){document.querySelector('#
 				}
 			}
 		})
+	}
+}
+
+func TestViewerStateEdgeCases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><style>.slide{position:absolute;width:640px;height:360px;left:24px;top:80px}</style>
+<div role="slider" aria-label="Zoom" aria-valuenow="2" aria-valuemax="10"></div>
+<div data-page-id="99" class="slide" style="left:-100px"></div>
+<div data-page-id="0" class="slide"></div><button>1 / 21</button>`)
+	}))
+	defer server.Close()
+	alloc, stop := chromedp.NewExecAllocator(context.Background(), chromedp.DefaultExecAllocatorOptions[:]...)
+	defer stop()
+	ctx, closeTab := chromedp.NewContext(alloc)
+	defer closeTab()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var state pageState
+	if err := chromedp.Run(ctx, chromedp.EmulateViewport(1600, 1200), chromedp.Navigate(server.URL+"#2"), chromedp.Evaluate(pageStateJS, &state)); err != nil {
+		t.Fatal(err)
+	}
+	if state.Total != 21 || state.Current != 1 {
+		t.Errorf("zoom control or offscreen page mistaken for active viewer state: %+v", state)
+	}
+	if err := waitForPage(ctx, 2); err == nil {
+		t.Fatal("stale URL hash overrode the actual page index")
 	}
 }
