@@ -35,7 +35,7 @@ brew install --cask google-chrome
 ## Usage
 
 ```
-deckk <url> [-o output.pdf] [--email you@example.com] [--headful]
+deckk [flags] <url>
 ```
 
 Flags:
@@ -43,17 +43,64 @@ Flags:
 - `-o, --output` — output path (default: `~/Desktop/deck.pdf`)
 - `--email` — email to use when a deck is gated. Defaults to your
   `git config user.email`. Only sent if the deck actually prompts for one.
+- `--provider` — choose an adapter explicitly, for example `--provider papermark`
+  for a branded domain whose URL cannot be recognized automatically.
+- `--name` — visitor name requested by a Papermark access form.
+- `--field identifier=value` — a Papermark text, long-text, number, URL or phone
+  access field. Repeat for multiple fields. Values are only filled in matching
+  form controls; unknown fields fail. Checkbox/consent controls remain manual.
+- `--passcode` — password for a protected DocSend or Papermark deck. Only submitted to
+  its access form when requested.
+- `--verification-code` — DocSend or Papermark email verification code, if already known.
+  Otherwise, the CLI prompts for the code when the verification form appears,
+  keeping the browser session open while you retrieve it. It does not read
+  your inbox. The total timeout also covers time spent waiting for a code.
+- `--verification-link` — an unopened DocSend email authentication link. Direct
+  links and Postmark tracking links are supported; tracking links are decoded
+  locally and only DocSend is visited. Use `--verification-link -` to read it
+  from stdin. If DocSend denies the slide images, the CLI also offers a link
+  prompt in the existing browser session. A 403 can have other causes, so stop
+  if no verification email was requested. Supplied links must name this deck.
 - `--headful` — show the browser window (useful for debugging an adapter)
 - `--timeout` — total timeout (default: `5m`)
+
+For example, with an email and passcode (any verification code is prompted
+for later):
+
+```
+deckk --email you@example.com --passcode 'your-passcode' --timeout 10m https://docsend.com/view/abc123
+```
+
+## Agent skill
+
+The bundled [deckk skill](skills/deckk/SKILL.md) teaches an agent to invoke the
+CLI, handle access gates, check the saved PDF, and return the file through its
+host's attachment or download facility.
+
+Copy `skills/deckk` into your agent's skills directory (for Codex,
+`~/.codex/skills/deckk`) and put the CLI on its `PATH`. Build the CLI from this
+checkout to use the DocSend and Papermark credential and verification additions.
+Homebrew and `go install` install only the binary; copy the skill separately.
+
+Verification codes need an execution tool that can keep an interactive
+process open while the user retrieves the code. The CLI does not yet persist
+sessions or return structured JSON.
 
 ## Adapters
 
 `deckk` picks an adapter based on the URL. Today:
 
-- **docsend** — handles `docsend.com/view/...` decks. Drives the viewer in
-  headless Chrome, walks through each slide with the arrow key, captures a
-  tight screenshot of just the slide, and stitches them into a PDF. Handles
-  the email gate automatically if `--email` (or `git user.email`) is set.
+- **docsend** — handles `docsend.com/view/...` decks. Authenticates in local
+  headless Chrome and prefers the provider's native Download control when it
+  yields a PDF, preserving the original PDF bytes. Otherwise it downloads
+  original slide images through the viewer's page-data endpoints. If those
+  endpoints are unavailable, it falls back to
+  screenshots. A failed page after original-image extraction begins stops
+  the download; known page counts must be satisfied. Handles
+  email and passcode access forms, verification codes and emailed verification links,
+  with access gates checked both on the Space landing page and after opening
+  its document. Agreement gates stop for manual completion.
+  Rejected credentials stop the download; deckk does not bypass restrictions.
 - **canva** — handles `canva.com/design/.../view` decks and `canva.link`
   short links. Loads the public view page, reads the page count from the
   player, then walks through each slide with the arrow key. Canva plays
@@ -83,14 +130,19 @@ Flags:
   bar, and forces the light theme. Only works for pages published to the web
   (Share → Publish); private pages error out with a hint. Wide inline
   databases and tables may be clipped at the page edge.
-- **papermark** — handles `papermark.com/view/...` links. Papermark's
-  viewer asks its API for the deck once and gets back a signed image URL per
-  page, so `deckk` loads the page a single time, catches that response off
-  the wire, and downloads the page images directly — no slide-by-slide
-  paging, and Papermark only records one view. Handles the email gate
-  automatically if `--email` (or `git user.email`) is set. Password-protected
-  links and links that require an emailed verification code are not
-  supported, and custom-domain Papermark links won't be recognized.
+- **papermark** — recognizes `papermark.com/view/...` and legacy
+  `papermark.io/view/...` links, including embed links and individual data-room
+  document links. Use `--provider papermark` for branded/custom domains.
+  After authentication, it prefers the provider's native PDF download, then
+  a raw PDF or image, or original slide images. Page images are obtained from
+  the viewer's existing view; additional URLs are fetched in batches of 15.
+  Handles email, password, OTP, visitor-name and supplied custom text fields.
+  Agreement and checkbox gates stop for manual handling. Missing, duplicate
+  or corrupt pages fail; expired image URLs are refreshed once through the
+  existing view. When a watermark is configured, a native PDF is required so
+  extraction does not silently discard the overlay. Data-room index/bulk
+  exports, signing flows, video, spreadsheet and HTML-to-PDF conversion are
+  not supported; provide an individual PDF document link instead.
 - **pitch** — handles `pitch.com/v/...` decks. Loads the public player,
   reads the slide counter, then walks through each slide with the arrow key
   and screenshots just the slide into a PDF. Only works for publicly shared
@@ -104,6 +156,16 @@ Flags:
 
 Adding a new adapter means implementing one interface in `internal/adapter` and
 registering it. PRs welcome.
+
+Adapters that can return either a native PDF or slides implement
+`adapter.DocumentFetcher`, which chooses within the same browser session.
+The original image-only `Fetch` method is retained for image callers; native
+PDF results require `FetchDocument`. Existing PDF-only adapters continue to
+use `adapter.PDFFetcher`.
+
+Papermark integration references: its [viewer response](https://github.com/papermark/papermark/blob/ed19717/app/api/views/route.ts),
+[page URL endpoint](https://github.com/papermark/papermark/blob/ed19717/app/api/views/pages/route.ts),
+and [access forms](https://github.com/papermark/papermark/tree/ed19717/components/view/access-form).
 
 ## License
 

@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +21,7 @@ import (
 	"github.com/chromedp/chromedp"
 
 	"github.com/holman/deckk/internal/adapter"
+	"github.com/holman/deckk/internal/adapter/imagefetch"
 )
 
 func init() {
@@ -47,8 +48,8 @@ func (a *Adapter) Matches(rawURL string) bool {
 	if err != nil {
 		return false
 	}
-	host := strings.ToLower(u.Host)
-	if host != "papermark.com" && !strings.HasSuffix(host, ".papermark.com") {
+	host := strings.ToLower(u.Hostname())
+	if (u.Scheme != "https" && u.Scheme != "http") || !(host == "papermark.com" || strings.HasSuffix(host, ".papermark.com") || host == "papermark.io" || strings.HasSuffix(host, ".papermark.io")) {
 		return false
 	}
 	return strings.HasPrefix(u.Path, "/view/")
@@ -57,12 +58,13 @@ func (a *Adapter) Matches(rawURL string) bool {
 // viewsResponse is the subset of Papermark's POST /api/views response we
 // care about.
 type viewsResponse struct {
-	Type     string      `json:"type"` // "email-verification" when the link needs an OTP
-	Message  string      `json:"message"`
-	ViewID   string      `json:"viewId"`
-	File     string      `json:"file"`
-	FileType string      `json:"fileType"`
-	Pages    []pageEntry `json:"pages"`
+	Type            string          `json:"type"` // "email-verification" when the link needs an OTP
+	Message         string          `json:"message"`
+	WatermarkConfig json.RawMessage `json:"watermarkConfig"`
+	ViewID          string          `json:"viewId"`
+	File            string          `json:"file"`
+	FileType        string          `json:"fileType"`
+	Pages           []pageEntry     `json:"pages"`
 }
 
 type pageEntry struct {
@@ -80,20 +82,33 @@ func (p pageEntry) num() int {
 type viewsRequest struct {
 	DocumentVersionID string `json:"documentVersionId"`
 	LinkID            string `json:"linkId"`
+	ViewType          string `json:"viewType"`
 }
 
 // apiCall is one captured POST /api/views exchange.
 type apiCall struct {
-	Req  viewsRequest
-	Resp viewsResponse
-	Raw  []byte
-	Err  error
+	Req      viewsRequest
+	Resp     viewsResponse
+	Status   int
+	Endpoint string
+	Err      error
 }
 
 // Papermark signs at most this many page URLs per /api/views/pages call.
 const maxPagesPerRequest = 15
 
 func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options) ([]adapter.Slide, error) {
+	result, err := a.FetchDocument(ctx, rawURL, opts)
+	if err != nil {
+		return nil, err
+	}
+	if result.PDF != nil {
+		return nil, fmt.Errorf("native PDF available; use FetchDocument")
+	}
+	return result.Slides, nil
+}
+
+func (a *Adapter) FetchDocument(ctx context.Context, rawURL string, opts adapter.Options) (adapter.Document, error) {
 	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
@@ -116,41 +131,33 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		chromedp.EmulateViewport(1600, 1200),
 		chromedp.Navigate(rawURL),
 	); err != nil {
-		return nil, fmt.Errorf("navigate: %w", err)
+		return adapter.Document{}, fmt.Errorf("navigate: %w", err)
 	}
 
-	// An unprotected link fires /api/views on mount. A protected one shows
-	// the access form first, so if nothing arrives quickly, look for a gate.
-	call, ok := waitForCall(bctx, calls, 8*time.Second)
-	if !ok {
-		if err := handleAccessForm(bctx, opts.Email); err != nil {
-			return nil, err
-		}
-		call, ok = waitForCall(bctx, calls, 20*time.Second)
-		if !ok {
-			return nil, fmt.Errorf("viewer never requested the deck (no /api/views response)")
-		}
+	return fetchDocument(bctx, calls, opts)
+}
+
+func fetchSlides(bctx context.Context, calls <-chan apiCall, opts adapter.Options) ([]adapter.Slide, error) {
+	call, err := waitForDeck(bctx, calls, opts)
+	if err != nil {
+		return nil, err
 	}
-	if call.Err != nil {
-		return nil, call.Err
-	}
+	return processSlides(bctx, call, opts)
+}
+
+func processSlides(bctx context.Context, call apiCall, opts adapter.Options) ([]adapter.Slide, error) {
 	resp := call.Resp
-
-	switch {
-	case resp.Type == "email-verification":
-		return nil, fmt.Errorf("this link requires email verification (a one-time code sent to %s) — deckk can't complete that automatically", opts.Email)
-	case len(resp.Pages) == 0 && resp.File != "":
-		return nil, fmt.Errorf("this deck is served as a raw %s file rather than page images; not supported yet", orUnknown(resp.FileType))
-	case len(resp.Pages) == 0:
-		msg := resp.Message
-		if msg == "" {
-			msg = string(truncate(call.Raw, 300))
-		}
-		return nil, fmt.Errorf("viewer returned no pages: %s", msg)
+	if len(resp.Pages) == 0 {
+		return nil, fmt.Errorf("Papermark document is not served as page images; raw-file documents are not supported yet")
 	}
 
 	pages := resp.Pages
 	sort.Slice(pages, func(i, j int) bool { return pages[i].num() < pages[j].num() })
+	for i, p := range pages {
+		if p.num() != i+1 {
+			return nil, fmt.Errorf("incomplete Papermark page manifest: expected page %d, got %d", i+1, p.num())
+		}
+	}
 	fmt.Fprintf(os.Stderr, "deck has %d page(s)\n", len(pages))
 
 	// Ask for URLs for any pages the initial response left unsigned.
@@ -183,14 +190,22 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		if p.File == nil || *p.File == "" {
 			return nil, fmt.Errorf("no URL for page %d", p.num())
 		}
-		data, ctype, err := download(ctx, client, *p.File)
+		slide, err := imagefetch.Download(bctx, client, *p.File)
+		var httpErr *imagefetch.HTTPError
+		if errors.As(err, &httpErr) && (httpErr.Status == 401 || httpErr.Status == 403) && resp.ViewID != "" && call.Req.DocumentVersionID != "" {
+			// Renew an expired image URL using the existing authenticated view.
+			signed, signErr := fetchPageURLs(bctx, resp.ViewID, call.Req.DocumentVersionID, []int{p.num()})
+			if signErr != nil {
+				return nil, fmt.Errorf("refresh page %d: %w", p.num(), signErr)
+			}
+			if fresh := signed[p.num()]; fresh != "" {
+				slide, err = imagefetch.Download(bctx, client, fresh)
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("download page %d: %w", p.num(), err)
 		}
-		if ctype != "image/png" && ctype != "image/jpeg" {
-			return nil, fmt.Errorf("page %d is %s; only PNG/JPEG pages are supported", p.num(), ctype)
-		}
-		slides = append(slides, adapter.Slide{Data: data, ContentType: ctype})
+		slides = append(slides, slide)
 	}
 
 	if len(slides) == 0 {
@@ -205,6 +220,8 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 func listenForViewsAPI(bctx context.Context, calls chan<- apiCall) {
 	var mu sync.Mutex
 	pending := map[network.RequestID]viewsRequest{}
+	endpoints := map[network.RequestID]string{}
+	statuses := map[network.RequestID]int{}
 
 	chromedp.ListenTarget(bctx, func(ev interface{}) {
 		switch e := ev.(type) {
@@ -213,7 +230,7 @@ func listenForViewsAPI(bctx context.Context, calls chan<- apiCall) {
 				return
 			}
 			u, err := url.Parse(e.Request.URL)
-			if err != nil || u.Path != "/api/views" {
+			if err != nil || (u.Path != "/api/views" && u.Path != "/api/views-dataroom") {
 				return
 			}
 			var req viewsRequest
@@ -224,11 +241,22 @@ func listenForViewsAPI(bctx context.Context, calls chan<- apiCall) {
 			}
 			mu.Lock()
 			pending[e.RequestID] = req
+			endpoints[e.RequestID] = u.Path
 			mu.Unlock()
 
+		case *network.EventResponseReceived:
+			mu.Lock()
+			if _, ok := pending[e.RequestID]; ok && e.Response != nil {
+				statuses[e.RequestID] = int(e.Response.Status)
+			}
+			mu.Unlock()
 		case *network.EventLoadingFinished:
 			mu.Lock()
 			req, ok := pending[e.RequestID]
+			status := statuses[e.RequestID]
+			endpoint := endpoints[e.RequestID]
+			delete(endpoints, e.RequestID)
+			delete(statuses, e.RequestID)
 			if ok {
 				delete(pending, e.RequestID)
 			}
@@ -241,11 +269,16 @@ func listenForViewsAPI(bctx context.Context, calls chan<- apiCall) {
 				c := chromedp.FromContext(bctx)
 				execCtx := cdp.WithExecutor(bctx, c.Target)
 				body, err := network.GetResponseBody(id).Do(execCtx)
-				call := apiCall{Req: req, Raw: body}
+				if req.DocumentVersionID == "" {
+					if post, postErr := network.GetRequestPostData(id).Do(execCtx); postErr == nil {
+						_ = json.Unmarshal([]byte(post), &req)
+					}
+				}
+				call := apiCall{Req: req, Status: status, Endpoint: endpoint}
 				if err != nil {
 					call.Err = fmt.Errorf("read /api/views response: %w", err)
 				} else if err := json.Unmarshal(body, &call.Resp); err != nil {
-					call.Err = fmt.Errorf("parse /api/views response: %w (%s)", err, truncate(body, 200))
+					call.Err = fmt.Errorf("parse /api/views response: %w", err)
 				}
 				select {
 				case calls <- call:
@@ -258,6 +291,8 @@ func listenForViewsAPI(bctx context.Context, calls chan<- apiCall) {
 			_, ok := pending[e.RequestID]
 			if ok {
 				delete(pending, e.RequestID)
+				delete(statuses, e.RequestID)
+				delete(endpoints, e.RequestID)
 			}
 			mu.Unlock()
 			if ok {
@@ -268,17 +303,6 @@ func listenForViewsAPI(bctx context.Context, calls chan<- apiCall) {
 			}
 		}
 	})
-}
-
-func waitForCall(ctx context.Context, calls <-chan apiCall, d time.Duration) (apiCall, bool) {
-	select {
-	case c := <-calls:
-		return c, true
-	case <-time.After(d):
-		return apiCall{}, false
-	case <-ctx.Done():
-		return apiCall{}, false
-	}
 }
 
 // fetchPageURLsJS runs inside the page so the request rides on the viewer's
@@ -318,7 +342,7 @@ func fetchPageURLs(ctx context.Context, viewID, versionID string, nums []int) (m
 			return nil, fmt.Errorf("request page URLs: %w", err)
 		}
 		if res.Status != 200 {
-			return nil, fmt.Errorf("/api/views/pages returned %d: %s", res.Status, truncate([]byte(res.Body), 200))
+			return nil, fmt.Errorf("/api/views/pages returned HTTP %d; the view may have expired or access was denied", res.Status)
 		}
 		var parsed struct {
 			Pages []pageEntry `json:"pages"`
@@ -326,119 +350,20 @@ func fetchPageURLs(ctx context.Context, viewID, versionID string, nums []int) (m
 		if err := json.Unmarshal([]byte(res.Body), &parsed); err != nil {
 			return nil, fmt.Errorf("parse /api/views/pages: %w", err)
 		}
+		wanted := make(map[int]bool, len(batch))
+		for _, n := range batch {
+			wanted[n] = true
+		}
 		for _, p := range parsed.Pages {
-			if p.File != nil && *p.File != "" {
-				out[p.num()] = *p.File
+			if !wanted[p.num()] || p.File == nil || *p.File == "" {
+				return nil, fmt.Errorf("invalid or duplicate Papermark signed page %d", p.num())
 			}
+			delete(wanted, p.num())
+			out[p.num()] = *p.File
+		}
+		if len(wanted) > 0 {
+			return nil, fmt.Errorf("Papermark omitted %d requested page URL(s)", len(wanted))
 		}
 	}
 	return out, nil
-}
-
-func download(ctx context.Context, client *http.Client, u string) ([]byte, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-	// Trust the bytes over the header: signed-storage URLs sometimes come
-	// back as application/octet-stream.
-	ctype := http.DetectContentType(data)
-	if i := strings.Index(ctype, ";"); i >= 0 {
-		ctype = ctype[:i]
-	}
-	return data, ctype, nil
-}
-
-// --- access form (email / password gate) ---------------------------------
-
-const findAccessFormJS = `
-(() => {
-  const visible = el => {
-    if (!el) return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
-  };
-  const email = document.querySelector('input#email[type="email"], input[name="email"][type="email"]');
-  const password = document.querySelector('input#password, input[name="password"]');
-  return { email: visible(email), password: visible(password) };
-})()
-`
-
-const fillAccessFormJS = `
-(email) => {
-  const input = document.querySelector('input#email[type="email"], input[name="email"][type="email"]');
-  if (!input) return 'no email input';
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-  setter.call(input, email);
-  input.dispatchEvent(new Event('input', { bubbles: true }));
-  input.dispatchEvent(new Event('change', { bubbles: true }));
-  const form = input.closest('form');
-  if (form) {
-    const btn = form.querySelector('button[type="submit"]') || form.querySelector('button');
-    if (btn) { btn.click(); return 'submitted via form button'; }
-    form.requestSubmit ? form.requestSubmit() : form.submit();
-    return 'submitted via form.submit()';
-  }
-  return 'no form found';
-}
-`
-
-type accessForm struct {
-	Email    bool `json:"email"`
-	Password bool `json:"password"`
-}
-
-// handleAccessForm fills Papermark's access form when the link is
-// email-gated. Password-protected links are reported as an error since we
-// have no way to supply one.
-func handleAccessForm(ctx context.Context, email string) error {
-	var gate accessForm
-	if err := chromedp.Run(ctx, chromedp.Evaluate(findAccessFormJS, &gate)); err != nil {
-		return fmt.Errorf("detect access form: %w", err)
-	}
-	if gate.Password {
-		return fmt.Errorf("this deck is password-protected; deckk can't supply a passcode")
-	}
-	if !gate.Email {
-		return fmt.Errorf("viewer never requested the deck and no access form was found (is the link still active?)")
-	}
-	if email == "" {
-		return fmt.Errorf("this deck requires an email — re-run with --email=you@example.com (or set `git config --global user.email`)")
-	}
-
-	fmt.Fprintf(os.Stderr, "deck is email-gated; submitting %s…\n", email)
-	var result string
-	script := fmt.Sprintf("(%s)(%q)", strings.TrimSpace(fillAccessFormJS), email)
-	if err := chromedp.Run(ctx, chromedp.Evaluate(script, &result)); err != nil {
-		return fmt.Errorf("fill access form: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "gate %s\n", result)
-	return nil
-}
-
-func orUnknown(s string) string {
-	if s == "" {
-		return "unknown"
-	}
-	return s
-}
-
-func truncate(b []byte, n int) []byte {
-	if len(b) > n {
-		return append(append([]byte{}, b[:n]...), []byte("…")...)
-	}
-	return b
 }

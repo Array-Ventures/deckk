@@ -2,6 +2,7 @@ package docsend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/chromedp/chromedp/kb"
 
 	"github.com/holman/deckk/internal/adapter"
+	"github.com/holman/deckk/internal/adapter/nativefile"
 )
 
 func init() {
@@ -30,7 +32,7 @@ func (a *Adapter) Matches(rawURL string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.HasSuffix(strings.ToLower(u.Host), "docsend.com")
+	return u.Scheme == "https" && isDocSendHost(u.Hostname())
 }
 
 var pageCounterRe = regexp.MustCompile(`(\d+)\s*/\s*(\d+)`)
@@ -169,7 +171,28 @@ const hideOverlaysJS = `
 })()
 `
 
+func (a *Adapter) FetchDocument(ctx context.Context, rawURL string, opts adapter.Options) (adapter.Document, error) {
+	slides, data, err := a.fetch(ctx, rawURL, opts)
+	return adapter.Document{Slides: slides, PDF: data}, err
+}
+
 func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options) ([]adapter.Slide, error) {
+	result, err := a.FetchDocument(ctx, rawURL, opts)
+	if err != nil {
+		return nil, err
+	}
+	if result.PDF != nil {
+		return nil, fmt.Errorf("native PDF available; use FetchDocument")
+	}
+	return result.Slides, nil
+}
+
+func (a *Adapter) fetch(ctx context.Context, rawURL string, opts adapter.Options) ([]adapter.Slide, []byte, error) {
+	if opts.VerificationLink != "" {
+		if _, err := verificationURL(opts.VerificationLink, rawURL); err != nil {
+			return nil, nil, err
+		}
+	}
 	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
@@ -192,21 +215,40 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		chromedp.Sleep(4*time.Second),
 		chromedp.Evaluate(hideOverlaysJS, nil),
 	); err != nil {
-		return nil, fmt.Errorf("navigate: %w", err)
+		return nil, nil, fmt.Errorf("navigate: %w", err)
 	}
 
-	// If the deck is gated behind an email prompt, fill it before we try to
-	// find slides.
-	if err := handleEmailGate(bctx, opts.Email); err != nil {
-		return nil, err
+	// Clear access gates before looking for slides.
+	if err := handleAccessGates(bctx, opts); err != nil {
+		return nil, nil, err
+	}
+
+	// Establish the visitor session before consuming its email link.
+	if opts.VerificationLink != "" {
+		if err := completeVerification(bctx, rawURL, opts.VerificationLink, opts); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// DocSend "Space" links (/view/s/<id>) land on a space home page listing
 	// documents after the gate, not a viewer. Step into the pitch deck.
 	if isSpaceURL(rawURL) {
 		if err := enterSpaceDocument(bctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		if err := handleAccessGates(bctx, opts); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if data, found, err := nativefile.Try(bctx); err != nil {
+		return nil, nil, err
+	} else if found && nativefile.IsPDF(data) {
+		if err := nativefile.ValidatePDF(data); err != nil {
+			return nil, nil, err
+		}
+		fmt.Fprintln(os.Stderr, "downloaded DocSend's native PDF")
+		return nil, data, nil
 	}
 
 	total, err := detectTotalSlides(bctx)
@@ -218,6 +260,34 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		total = -1
 	} else {
 		fmt.Fprintf(os.Stderr, "deck has %d slide(s) per viewer\n", total)
+	}
+	if slides, supported, err := fetchOriginalSlides(bctx, total); supported || err != nil {
+		if errors.Is(err, errVerificationRequired) && opts.VerificationLink == "" && opts.RequestVerificationLink != nil {
+			link, promptErr := opts.RequestVerificationLink(bctx)
+			if promptErr != nil {
+				return nil, nil, promptErr
+			}
+			if verifyErr := completeVerification(bctx, rawURL, link, opts); verifyErr != nil {
+				return nil, nil, verifyErr
+			}
+			if data, found, nativeErr := nativefile.Try(bctx); nativeErr != nil {
+				return nil, nil, nativeErr
+			} else if found && nativefile.IsPDF(data) {
+				if err := nativefile.ValidatePDF(data); err != nil {
+					return nil, nil, err
+				}
+				fmt.Fprintln(os.Stderr, "downloaded DocSend's native PDF")
+				return nil, data, nil
+			}
+			slides, supported, err = fetchOriginalSlides(bctx, total)
+			if !supported && err == nil {
+				return nil, nil, fmt.Errorf("DocSend image endpoints unavailable after verification")
+			}
+		}
+		if err == nil {
+			fmt.Fprintln(os.Stderr, "downloaded original DocSend slide images")
+		}
+		return slides, nil, err
 	}
 
 	// Sanity cap for counter-less decks; real decks are far shorter.
@@ -233,14 +303,14 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 				chromedp.KeyEvent(kb.ArrowRight),
 				chromedp.Sleep(250*time.Millisecond),
 			); err != nil {
-				return nil, fmt.Errorf("advance to slide %d: %w", i, err)
+				return nil, nil, fmt.Errorf("advance to slide %d: %w", i, err)
 			}
 		}
 
 		// Cookie banner / next-arrow can re-render on navigation; re-hide
 		// before each screenshot.
 		if err := chromedp.Run(bctx, chromedp.Evaluate(hideOverlaysJS, nil)); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		var rect slideRect
@@ -252,6 +322,9 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 			}
 			rect = r
 		} else if r, err := waitForSlideReady(bctx, i); err != nil {
+			if total > 0 {
+				return nil, nil, fmt.Errorf("incomplete DocSend deck at page %d/%d: %w", i, total, err)
+			}
 			// Past the real deck (placeholder never resolves to a real image)
 			// is the normal stop condition; downstream is the docsend upsell.
 			fmt.Fprintf(os.Stderr, "warning: stopped at slide %d — %v\n", i, err)
@@ -263,18 +336,21 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 
 		png, err := captureClip(bctx, rect)
 		if err != nil {
-			return nil, fmt.Errorf("screenshot slide %d: %w", i, err)
+			return nil, nil, fmt.Errorf("screenshot slide %d: %w", i, err)
 		}
 		slides = append(slides, adapter.Slide{Data: png, ContentType: "image/png"})
 	}
 	if total < 0 && len(slides) >= maxSlides {
-		return nil, fmt.Errorf("hit %d-slide cap; deck may be longer than expected", maxSlides)
+		return nil, nil, fmt.Errorf("hit %d-slide cap; deck may be longer than expected", maxSlides)
 	}
 
 	if len(slides) == 0 {
-		return nil, fmt.Errorf("no slides captured")
+		return nil, nil, fmt.Errorf("no slides captured")
 	}
-	return slides, nil
+	if total > 0 && len(slides) != total {
+		return nil, nil, fmt.Errorf("incomplete DocSend deck: captured %d/%d slides", len(slides), total)
+	}
+	return slides, nil, nil
 }
 
 func detectTotalSlides(ctx context.Context) (int, error) {
@@ -284,6 +360,16 @@ func detectTotalSlides(ctx context.Context) (int, error) {
 	}
 	m := pageCounterRe.FindStringSubmatch(bodyText)
 	if m == nil {
+		var count int
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
+  const explicit = [...document.querySelectorAll('[data-page-num]')].map(el => Number(el.getAttribute('data-page-num'))).filter(n => Number.isInteger(n) && n > 0);
+  return explicit.length ? Math.max(...explicit) : document.querySelectorAll('.carousel-inner .item').length;
+})()`, &count)); err != nil {
+			return 0, err
+		}
+		if count > 0 && count <= 300 {
+			return count, nil
+		}
 		return 0, fmt.Errorf("could not detect slide count (no n/N marker)")
 	}
 	n, err := strconv.Atoi(m[2])
@@ -452,144 +538,4 @@ func lastSeg(s string) string {
 		return s[i+1:]
 	}
 	return s
-}
-
-// findVisibleEmailInputJS locates the email-collection input of a gated
-// deck. Pass 1 keeps the original attribute-based match (type/name/id).
-// Pass 2 falls back to plain text inputs whose placeholder, aria-label, or
-// associated <label> mentions email, covering gates that render a generic
-// text input. Visibility and the feedback/comment-form exclusions apply to
-// both passes: some viewers mount email-looking inputs inside feedback or
-// chat widgets on the same page, and submitting those would message the
-// deck owner instead of unlocking the deck.
-const findVisibleEmailInputJS = `
-function() {
-  const visible = (el) => {
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
-  };
-  const excluded = (el) => {
-    const form = el.closest('form');
-    return !!form && /feedback|doc-chat|comment/i.test(form.id + ' ' + (typeof form.className === 'string' ? form.className : ''));
-  };
-  const labeledEmail = (el) => {
-    const hay = ((el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
-    if (hay.includes('email')) return true;
-    if (el.labels) {
-      for (const l of el.labels) { if ((l.textContent || '').toLowerCase().includes('email')) return true; }
-    }
-    return false;
-  };
-  const attrs = document.querySelectorAll('input[type="email"], input[name="email"], input#email');
-  for (const el of attrs) {
-    if (!visible(el) || excluded(el)) continue;
-    return el;
-  }
-  const texts = document.querySelectorAll('input[type="text"], input:not([type])');
-  for (const el of texts) {
-    if (!visible(el) || excluded(el)) continue;
-    if (labeledEmail(el)) return el;
-  }
-  return null;
-}
-`
-
-const detectEmailGateJS = `
-(() => {
-  const findVisibleEmailInput = ` + findVisibleEmailInputJS + `;
-  return findVisibleEmailInput() !== null;
-})()
-`
-
-// fillEmailGateJS fills the auth email input and submits its surrounding
-// form. We dispatch input/change events so React-controlled inputs see
-// the value, and prefer the form's own submit button so any client-side
-// validation hooks fire correctly.
-const fillEmailGateJS = `
-(email) => {
-  const findVisibleEmailInput = ` + findVisibleEmailInputJS + `;
-  const input = findVisibleEmailInput();
-  if (!input) return 'no visible email input';
-
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-  setter.call(input, email);
-  input.dispatchEvent(new Event('input', { bubbles: true }));
-  input.dispatchEvent(new Event('change', { bubbles: true }));
-  input.dispatchEvent(new Event('blur', { bubbles: true }));
-
-  const form = input.closest('form');
-  if (form) {
-    const btn = form.querySelector('button[type="submit"], input[type="submit"]')
-             || form.querySelector('button');
-    if (btn) { btn.click(); return 'submitted via form button'; }
-    form.submit();
-    return 'submitted via form.submit()';
-  }
-  // No form ancestor — try a nearby "Continue/Submit/View/Confirm" button.
-  const btn = Array.from(document.querySelectorAll('button')).find(b => /continue|submit|view|access|confirm/i.test(b.textContent || ''));
-  if (btn) { btn.click(); return 'submitted via nearby button'; }
-  return 'no submit path found';
-}
-`
-
-// handleEmailGate checks for an email-gated landing page. If gated, fills
-// the form with the provided email and waits for the slide viewer to
-// appear. If gated but no email is available, returns a clear error so
-// the user can re-run with --email.
-//
-// The gate modal mounts after the viewer fetches link metadata, so a
-// single immediate check can run before it exists: poll briefly before
-// concluding the deck is ungated.
-func handleEmailGate(ctx context.Context, email string) error {
-	var gated bool
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if err := chromedp.Run(ctx, chromedp.Evaluate(detectEmailGateJS, &gated)); err != nil {
-			return fmt.Errorf("detect email gate: %w", err)
-		}
-		if gated || time.Now().After(deadline) {
-			break
-		}
-		if err := chromedp.Run(ctx, chromedp.Sleep(500*time.Millisecond)); err != nil {
-			return err
-		}
-	}
-	if !gated {
-		return nil
-	}
-
-	if email == "" {
-		return fmt.Errorf("this deck requires an email — re-run with --email=you@example.com (or set `git config --global user.email`)")
-	}
-
-	fmt.Fprintf(os.Stderr, "deck is email-gated; submitting %s…\n", email)
-
-	var submitResult string
-	script := fmt.Sprintf("(%s)(%q)", strings.TrimSpace(fillEmailGateJS), email)
-	if err := chromedp.Run(ctx, chromedp.Evaluate(script, &submitResult)); err != nil {
-		return fmt.Errorf("fill email gate: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "gate %s\n", submitResult)
-
-	// Wait until the gate goes away and the viewer renders. Cap at ~15s.
-	gateClearDeadline := time.Now().Add(15 * time.Second)
-	for {
-		var stillGated bool
-		if err := chromedp.Run(ctx, chromedp.Evaluate(detectEmailGateJS, &stillGated)); err != nil {
-			return err
-		}
-		if !stillGated {
-			// Give the viewer a beat to mount and load its first slide.
-			return chromedp.Run(ctx,
-				chromedp.Sleep(3*time.Second),
-				chromedp.Evaluate(hideOverlaysJS, nil),
-			)
-		}
-		if time.Now().After(gateClearDeadline) {
-			return fmt.Errorf("email gate did not clear after submitting %s (rejected?)", email)
-		}
-		if err := chromedp.Run(ctx, chromedp.Sleep(500*time.Millisecond)); err != nil {
-			return err
-		}
-	}
 }

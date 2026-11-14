@@ -18,3 +18,18 @@ func TestIsSpaceURL(t *testing.T) {
 		}
 	}
 }
+
+func TestMatches(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"https://docsend.com/view/abc":           true,
+		"https://www.docsend.com/view/abc":       true,
+		"https://docsend.dropbox.com/view/abc":   true,
+		"https://evildocsend.com/view/abc":       false,
+		"https://docsend.com.evil.test/view/abc": false,
+		"http://docsend.com/view/abc":            false,
+	} {
+		if got := (&Adapter{}).Matches(raw); got != want {
+			t.Errorf("Matches(%q) = %v; want %v", raw, got, want)
+		}
+	}
+}
