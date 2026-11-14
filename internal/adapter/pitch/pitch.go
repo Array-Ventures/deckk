@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/kb"
 
 	"github.com/holman/deckk/internal/adapter"
+	"github.com/holman/deckk/internal/adapter/screenshot"
 )
 
 func init() {
@@ -32,9 +32,7 @@ func (a *Adapter) Matches(rawURL string) bool {
 	return host == "pitch.com" || strings.HasSuffix(host, ".pitch.com")
 }
 
-type viewportRect struct {
-	X, Y, W, H float64
-}
+type viewportRect = screenshot.Rect
 
 // findSlideJS returns the rect of the currently-visible slide plus the
 // deck's slide counter. Pitch's public player (`/v/...`) renders the active
@@ -142,6 +140,7 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 	fmt.Fprintf(os.Stderr, "deck has %d slide(s)\n", maxSlides)
 
 	var slides []adapter.Slide
+	var previous []byte
 	for i := 1; i <= maxSlides; i++ {
 		if i > 1 {
 			if err := chromedp.Run(bctx, chromedp.KeyEvent(kb.ArrowRight)); err != nil {
@@ -160,10 +159,14 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 			return nil, err
 		}
 
-		shot, err := captureViewportClip(bctx, viewportRect{X: rect.X, Y: rect.Y, W: rect.W, H: rect.H})
+		shot, err := screenshot.CaptureSettled(bctx, viewportRect{X: rect.X, Y: rect.Y, W: rect.W, H: rect.H}, previous)
 		if err != nil {
 			return nil, fmt.Errorf("screenshot slide %d: %w", i, err)
 		}
+		if _, err := waitForSlide(bctx, i, maxSlides); err != nil {
+			return nil, fmt.Errorf("slide changed during capture: %w", err)
+		}
+		previous = shot
 		slides = append(slides, adapter.Slide{Data: shot, ContentType: "image/png"})
 	}
 
@@ -205,23 +208,4 @@ func findSlide(ctx context.Context) (*slideInfo, error) {
 		return nil, fmt.Errorf("find slide: %w", err)
 	}
 	return info, nil
-}
-
-func captureViewportClip(ctx context.Context, r viewportRect) ([]byte, error) {
-	var buf []byte
-	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		var err error
-		buf, err = page.CaptureScreenshot().
-			WithFormat(page.CaptureScreenshotFormatPng).
-			WithClip(&page.Viewport{
-				X:      r.X,
-				Y:      r.Y,
-				Width:  r.W,
-				Height: r.H,
-				Scale:  2,
-			}).
-			Do(ctx)
-		return err
-	}))
-	return buf, err
 }

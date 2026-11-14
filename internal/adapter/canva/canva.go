@@ -1,19 +1,19 @@
 package canva
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/kb"
 
 	"github.com/holman/deckk/internal/adapter"
+	"github.com/holman/deckk/internal/adapter/screenshot"
 )
 
 func init() {
@@ -37,9 +37,7 @@ func (a *Adapter) Matches(rawURL string) bool {
 		host == "canva.link" || strings.HasSuffix(host, ".canva.link")
 }
 
-type viewportRect struct {
-	X, Y, W, H float64
-}
+type viewportRect = screenshot.Rect
 
 // activePageJS selects the same fully visible page for both navigation checks
 // and cropping. Offscreen mounted pages and thumbnails are not active slides.
@@ -182,12 +180,8 @@ const hideOverlaysJS = `
 })()
 `
 
-// pageStateJS reads Canva's own idea of where we are in the deck. The
-// /view player exposes a "Go to page" slider (role=slider) whose
-// aria-valuemax is the real page count and aria-valuenow the current
-// page. The URL hash also tracks the current page ("#3"). Both are far
-// more trustworthy than counting stacked DOM boxes, so we prefer them and
-// only fall back to the cluster heuristic if neither is present.
+// pageStateJS reads the page counter and active page index, retaining the
+// last known total when the anonymous viewer temporarily unmounts its counter.
 const pageStateJS = `
 (() => {
   let total = 0, current = 0;
@@ -226,19 +220,7 @@ type pageState struct {
 	HashPage int `json:"hashPage"`
 }
 
-// Timing knobs for the animation wait. Canva plays each page's element
-// animations (fade/rise/pan…) on entry and drives them from JS, so there's
-// no DOM or Web Animations signal to hook — the only honest "done" is
-// "the pixels stopped changing". We poll clipped screenshots and accept a
-// frame once it has repeated stableSamples times in a row. maxSettle caps
-// how long a looping element (GIF, video, infinite animation) can hold us
-// up; after that we take the latest frame and move on.
-const (
-	settlePoll    = 300 * time.Millisecond
-	stableSamples = 3
-	maxSettle     = 12 * time.Second
-	pageFlipWait  = 3 * time.Second
-)
+const pageFlipWait = 3 * time.Second
 
 func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options) ([]adapter.Slide, error) {
 	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
@@ -286,14 +268,14 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 	fmt.Fprintf(os.Stderr, "deck has %d slide(s)\n", total)
 
 	var slides []adapter.Slide
-	var lastHash [32]byte
+	var previous []byte
 	for i := 1; i <= total; i++ {
 		if i > 1 {
 			if err := chromedp.Run(bctx, chromedp.KeyEvent(kb.ArrowRight)); err != nil {
 				return nil, fmt.Errorf("advance to slide %d: %w", i, err)
 			}
 		}
-		if err := waitForPage(bctx, i); err != nil {
+		if err := waitForPage(bctx, i, total); err != nil {
 			return nil, fmt.Errorf("expected slide %d: %w", i, err)
 		}
 		if err := chromedp.Run(bctx, chromedp.Evaluate(hideOverlaysJS, nil)); err != nil {
@@ -306,16 +288,18 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 			return nil, fmt.Errorf("slide %d vanished; no partial PDF was saved", i)
 		}
 		playerRect := viewportRect{X: det.X, Y: det.Y, W: det.W, H: det.H}
-		shot, err := captureSettled(bctx, playerRect)
+		shot, err := screenshot.CaptureSettled(bctx, playerRect, previous)
 		if err != nil {
 			return nil, fmt.Errorf("screenshot slide %d: %w", i, err)
 		}
-		h := sha256.Sum256(shot)
-		if i > 1 && h == lastHash {
+		if i > 1 && bytes.Equal(shot, previous) {
 			// The counter confirmed this page; retain intentional duplicates.
 			fmt.Fprintf(os.Stderr, "slide %d looks identical to slide %d; keeping it\n", i, i-1)
 		}
-		lastHash = h
+		if err := waitForPage(bctx, i, total); err != nil {
+			return nil, fmt.Errorf("slide changed during capture: %w", err)
+		}
+		previous = shot
 		slides = append(slides, adapter.Slide{Data: shot, ContentType: "image/png"})
 		fmt.Fprintf(os.Stderr, "captured slide %d/%d\n", i, total)
 	}
@@ -328,14 +312,17 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 
 // waitForPage blocks until Canva reports page n as current (slider value
 // or URL hash), so a slow page flip can't be mistaken for "no change".
-func waitForPage(ctx context.Context, n int) error {
+func waitForPage(ctx context.Context, n, total int) error {
 	deadline := time.Now().Add(pageFlipWait)
 	for {
 		var st pageState
 		if err := chromedp.Run(ctx, chromedp.Evaluate(pageStateJS, &st)); err != nil {
 			return err
 		}
-		if st.Current == n {
+		if st.Total > 0 && st.Total != total {
+			return fmt.Errorf("Canva page count changed from %d to %d; no partial PDF was saved", total, st.Total)
+		}
+		if st.Current == n && st.Total == total {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -345,60 +332,4 @@ func waitForPage(ctx context.Context, n int) error {
 			return err
 		}
 	}
-}
-
-// captureSettled screenshots the player repeatedly until the image stops
-// changing (see the settle constants above), then returns the final frame.
-// This is how we wait out Canva's entry animations without knowing
-// anything about them.
-func captureSettled(ctx context.Context, r viewportRect) ([]byte, error) {
-	deadline := time.Now().Add(maxSettle)
-	var (
-		last    [32]byte
-		shot    []byte
-		repeats int
-	)
-	for {
-		var err error
-		shot, err = captureViewportClip(ctx, r)
-		if err != nil {
-			return nil, err
-		}
-		h := sha256.Sum256(shot)
-		if h == last {
-			repeats++
-			if repeats >= stableSamples-1 {
-				return shot, nil
-			}
-		} else {
-			repeats = 0
-			last = h
-		}
-		if time.Now().After(deadline) {
-			fmt.Fprintf(os.Stderr, "slide still animating after %s; capturing as-is\n", maxSettle)
-			return shot, nil
-		}
-		if err := chromedp.Run(ctx, chromedp.Sleep(settlePoll)); err != nil {
-			return nil, err
-		}
-	}
-}
-
-func captureViewportClip(ctx context.Context, r viewportRect) ([]byte, error) {
-	var buf []byte
-	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		var err error
-		buf, err = page.CaptureScreenshot().
-			WithFormat(page.CaptureScreenshotFormatPng).
-			WithClip(&page.Viewport{
-				X:      r.X,
-				Y:      r.Y,
-				Width:  r.W,
-				Height: r.H,
-				Scale:  2,
-			}).
-			Do(ctx)
-		return err
-	}))
-	return buf, err
 }

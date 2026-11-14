@@ -55,7 +55,7 @@ footer{position:absolute;top:900px}</style>
 	if err := chromedp.Run(ctx, chromedp.KeyEvent(kb.ArrowRight)); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitForPage(ctx, 2); err != nil {
+	if err := waitForPage(ctx, 2, 21); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -121,7 +121,7 @@ func TestViewerStateEdgeCases(t *testing.T) {
 	if state.Total != 21 || state.Current != 1 {
 		t.Errorf("zoom control or offscreen page mistaken for active viewer state: %+v", state)
 	}
-	if err := waitForPage(ctx, 2); err == nil {
+	if err := waitForPage(ctx, 2, 21); err == nil {
 		t.Fatal("stale URL hash overrode the actual page index")
 	}
 }
