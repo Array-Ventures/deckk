@@ -106,6 +106,9 @@ sessions or return structured JSON.
   player, then walks through each slide with the arrow key. Canva plays
   per-slide animations on entry, so `deckk` waits for the rendered slide to
   stop changing before screenshotting it (about 5–7s per animated slide).
+  Reads the viewer's page counter and checks every page advance, including
+  the newer anonymous viewer with a thumbnail strip. If the counter is
+  unavailable or navigation stalls, it fails instead of saving a partial deck.
   Only works for publicly shared view links (no Canva login).
 - **google-drive** — handles `drive.google.com/file/d/...` links (and the
   older `open?id=` / `uc?id=` forms). Drive doesn't convert anything, it
