@@ -41,29 +41,39 @@ type viewportRect struct {
 	X, Y, W, H float64
 }
 
-// detectPlayerJS figures out (a) the rect of the slide player and (b) how
-// many real slides the deck has. Canva's /view page renders all pages
-// stacked on top of each other at the same coordinates — only the
-// "active" one is visible — so we exploit that: the largest cluster of
-// same-sized, same-position boxes is the deck. The cluster also contains
-// a few non-slide overlays (end card, share/replay, "more from Canva"),
-// so we filter to elements whose content actually looks like a rendered
-// slide: an image / SVG / canvas / background-image that fills most of
-// the box. Returns viewport-space rect for CDP's screenshot clip.
+// activePageJS selects the same fully visible page for both navigation checks
+// and cropping. Offscreen mounted pages and thumbnails are not active slides.
+const activePageJS = `
+(() => Array.from(document.querySelectorAll('[data-page-id]'))
+  .filter(el => {
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return /^\d+$/.test(el.dataset.pageId) && Number.isSafeInteger(Number(el.dataset.pageId)) &&
+      r.width >= 400 && r.height >= 250 && r.left >= 0 && r.top >= 0 &&
+      r.right <= innerWidth + 1 && r.bottom <= innerHeight + 1 &&
+      r.width / r.height >= 0.5 && r.width / r.height <= 3 &&
+      s.visibility !== 'hidden' && s.opacity !== '0';
+  })
+  .sort((a, b) => {
+    const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+    return br.width * br.height - ar.width * ar.height;
+  })[0] || null)()
+`
+
+// detectPlayerJS returns the visible slide bounds. Legacy players use a
+// cluster of equally sized layers; its size never determines the page count.
 const detectPlayerJS = `
 (() => {
   // The newer anonymous viewer uses an editor-like shell with a thumbnail
   // filmstrip. Its presentation region bounds the slide, not the whole shell.
-  const regions = Array.from(document.querySelectorAll('[data-page-id]'))
-    .map(el => el.getBoundingClientRect())
-    .filter(r => r.width >= 400 && r.height >= 250 && r.left >= 0 && r.top >= 0 &&
-      r.right <= innerWidth + 1 && r.bottom <= innerHeight + 1 &&
-      r.width / r.height >= 0.5 && r.width / r.height <= 3)
-    .sort((a, b) => b.width * b.height - a.width * a.height);
-  if (regions.length) {
-    const r = regions[0];
-    return { x: r.x, y: r.y, w: r.width, h: r.height, clusterSize: 1, count: 0 };
+  const active = (` + activePageJS + `);
+  if (active) {
+    const r = active.getBoundingClientRect();
+    return { x: r.x, y: r.y, w: r.width, h: r.height };
   }
+  // A modern viewer with no fully visible page must not fall through to
+  // screenshotting the surrounding application shell.
+  if (document.querySelector('[data-page-id]')) return null;
   const all = Array.from(document.querySelectorAll('div, section, article, figure'));
   const buckets = new Map();
   for (const el of all) {
@@ -81,34 +91,9 @@ const detectPlayerJS = `
   }
   if (!best || best.els.length < 1) return null;
 
-  const looksLikeSlide = el => {
-    // Real slide content: a sizeable image/svg/canvas descendant, or a
-    // background-image. End-card overlays are usually plain text + buttons
-    // with no large pixel content.
-    const r = el.getBoundingClientRect();
-    const minArea = (r.width * r.height) * 0.3;
-    const media = el.querySelectorAll('img, svg, canvas, picture, video');
-    for (const m of media) {
-      const mr = m.getBoundingClientRect();
-      if (mr.width * mr.height >= minArea) return true;
-    }
-    const stack = [el, ...el.querySelectorAll('div')];
-    for (const n of stack.slice(0, 200)) {
-      const bg = getComputedStyle(n).backgroundImage;
-      if (bg && bg !== 'none' && /url\(/i.test(bg)) {
-        const nr = n.getBoundingClientRect();
-        if (nr.width * nr.height >= minArea) return true;
-      }
-    }
-    return false;
-  };
-
-  const kept = best.els.filter(looksLikeSlide);
   const r = best.rect;
   return {
     x: r.x, y: r.y, w: r.width, h: r.height,
-    clusterSize: best.els.length,
-    count: kept.length,
   };
 })()
 `
@@ -206,7 +191,8 @@ const hideOverlaysJS = `
 const pageStateJS = `
 (() => {
   let total = 0, current = 0;
-  const sl = document.querySelector('[role="slider"]');
+  const sl = Array.from(document.querySelectorAll('[role="slider"]'))
+    .find(el => /page/i.test(el.getAttribute('aria-label') || ''));
   if (sl) {
     total = parseInt(sl.getAttribute('aria-valuemax') || '0', 10) || 0;
     current = parseInt(sl.getAttribute('aria-valuenow') || '0', 10) || 0;
@@ -219,17 +205,9 @@ const pageStateJS = `
       if (m) { current = parseInt(m[1], 10); total = parseInt(m[2], 10); break; }
     }
   }
-  if (!total) {
-    const m = (document.body.innerText || '').match(/(\d+)\s*\/\s*(\d+)/);
-    if (m) { current = parseInt(m[1], 10); total = parseInt(m[2], 10); }
-  }
   // The anonymous viewer can unmount the counter text while idle. Its
   // full-size page node still exposes the current zero-based page index.
-  const active = Array.from(document.querySelectorAll('[data-page-id]')).find(el => {
-    const r = el.getBoundingClientRect();
-    return r.width >= 400 && r.height >= 250 && r.right > 0 && r.bottom > 0 &&
-      r.left < innerWidth && r.top < innerHeight && /^\d+$/.test(el.dataset.pageId);
-  });
+  const active = (` + activePageJS + `);
   if (active) {
     current = Number(active.dataset.pageId) + 1;
     if (total) window.__deckkCanvaPageTotal = total;
@@ -287,15 +265,11 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		return nil, fmt.Errorf("navigate: %w", err)
 	}
 
-	var det *struct {
-		X, Y, W, H  float64
-		ClusterSize int `json:"clusterSize"`
-		Count       int `json:"count"`
-	}
+	var det *viewportRect
 	if err := chromedp.Run(bctx, chromedp.Evaluate(detectPlayerJS, &det)); err != nil {
 		return nil, fmt.Errorf("detect player: %w", err)
 	}
-	if det == nil || det.ClusterSize == 0 {
+	if det == nil || det.W <= 0 || det.H <= 0 {
 		return nil, fmt.Errorf("could not find slide player on the page")
 	}
 
@@ -318,9 +292,9 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 			if err := chromedp.Run(bctx, chromedp.KeyEvent(kb.ArrowRight)); err != nil {
 				return nil, fmt.Errorf("advance to slide %d: %w", i, err)
 			}
-			if err := waitForPage(bctx, i); err != nil {
-				return nil, fmt.Errorf("advance to slide %d: %w", i, err)
-			}
+		}
+		if err := waitForPage(bctx, i); err != nil {
+			return nil, fmt.Errorf("expected slide %d: %w", i, err)
 		}
 		if err := chromedp.Run(bctx, chromedp.Evaluate(hideOverlaysJS, nil)); err != nil {
 			return nil, err
@@ -361,7 +335,7 @@ func waitForPage(ctx context.Context, n int) error {
 		if err := chromedp.Run(ctx, chromedp.Evaluate(pageStateJS, &st)); err != nil {
 			return err
 		}
-		if st.Current == n || st.HashPage == n {
+		if st.Current == n {
 			return nil
 		}
 		if time.Now().After(deadline) {
