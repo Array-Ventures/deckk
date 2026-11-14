@@ -52,6 +52,18 @@ type viewportRect struct {
 // the box. Returns viewport-space rect for CDP's screenshot clip.
 const detectPlayerJS = `
 (() => {
+  // The newer anonymous viewer uses an editor-like shell with a thumbnail
+  // filmstrip. Its presentation region bounds the slide, not the whole shell.
+  const regions = Array.from(document.querySelectorAll('[data-page-id]'))
+    .map(el => el.getBoundingClientRect())
+    .filter(r => r.width >= 400 && r.height >= 250 && r.left >= 0 && r.top >= 0 &&
+      r.right <= innerWidth + 1 && r.bottom <= innerHeight + 1 &&
+      r.width / r.height >= 0.5 && r.width / r.height <= 3)
+    .sort((a, b) => b.width * b.height - a.width * a.height);
+  if (regions.length) {
+    const r = regions[0];
+    return { x: r.x, y: r.y, w: r.width, h: r.height, clusterSize: 1, count: 0 };
+  }
   const all = Array.from(document.querySelectorAll('div, section, article, figure'));
   const buckets = new Map();
   for (const el of all) {
@@ -109,6 +121,8 @@ const detectPlayerJS = `
 const hideOverlaysJS = `
 (() => {
   const hide = el => el && el.style.setProperty('display', 'none', 'important');
+  const modern = Array.from(document.querySelectorAll('[data-page-id]'))
+    .some(el => { const r = el.getBoundingClientRect(); return r.width >= 400 && r.height >= 250; });
   const selectors = [
     '#onetrust-banner-sdk',
     '#onetrust-consent-sdk',
@@ -131,6 +145,9 @@ const hideOverlaysJS = `
     '#hubspot-messages-iframe-container',
   ];
   for (const sel of selectors) {
+    // The anonymous editor shell virtualizes hidden controls, including its
+    // page counter. Its chrome already sits outside our presentation crop.
+    if (modern && !/cookie|consent|truste|onetrust|intercom|hubspot/i.test(sel)) continue;
     document.querySelectorAll(sel).forEach(hide);
   }
 
@@ -159,6 +176,7 @@ const hideOverlaysJS = `
   // Floating action buttons (Present, Share, Edit, …) — walk up to the
   // nearest small floating wrapper so we hide just the chip, not its
   // anchored container.
+  if (modern) return;
   for (const sel of [
     'button[aria-label*="Present" i]',
     'button[aria-label*="Share" i]',
@@ -194,8 +212,28 @@ const pageStateJS = `
     current = parseInt(sl.getAttribute('aria-valuenow') || '0', 10) || 0;
   }
   if (!total) {
+    // Read textContent even after the footer is hidden for screenshots. The
+    // page counter may be a button; the only range input can be Zoom.
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const m = (el.textContent || '').trim().match(/^(\d+)\s*\/\s*(\d+)$/);
+      if (m) { current = parseInt(m[1], 10); total = parseInt(m[2], 10); break; }
+    }
+  }
+  if (!total) {
     const m = (document.body.innerText || '').match(/(\d+)\s*\/\s*(\d+)/);
     if (m) { current = parseInt(m[1], 10); total = parseInt(m[2], 10); }
+  }
+  // The anonymous viewer can unmount the counter text while idle. Its
+  // full-size page node still exposes the current zero-based page index.
+  const active = Array.from(document.querySelectorAll('[data-page-id]')).find(el => {
+    const r = el.getBoundingClientRect();
+    return r.width >= 400 && r.height >= 250 && r.right > 0 && r.bottom > 0 &&
+      r.left < innerWidth && r.top < innerHeight && /^\d+$/.test(el.dataset.pageId);
+  });
+  if (active) {
+    current = Number(active.dataset.pageId) + 1;
+    if (total) window.__deckkCanvaPageTotal = total;
+    else total = window.__deckkCanvaPageTotal || 0;
   }
   const hm = (location.hash || '').match(/^#(\d+)$/);
   const hashPage = hm ? parseInt(hm[1], 10) : 0;
@@ -243,6 +281,7 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 		chromedp.EmulateViewport(1600, 1200),
 		chromedp.Navigate(rawURL),
 		chromedp.Sleep(5*time.Second),
+		chromedp.Poll(`(`+pageStateJS+`).total > 0`, nil, chromedp.WithPollingTimeout(20*time.Second)),
 		chromedp.Evaluate(hideOverlaysJS, nil),
 	); err != nil {
 		return nil, fmt.Errorf("navigate: %w", err)
@@ -259,28 +298,18 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 	if det == nil || det.ClusterSize == 0 {
 		return nil, fmt.Errorf("could not find slide player on the page")
 	}
-	playerRect := viewportRect{X: det.X, Y: det.Y, W: det.W, H: det.H}
 
 	var st pageState
 	if err := chromedp.Run(bctx, chromedp.Evaluate(pageStateJS, &st)); err != nil {
 		return nil, fmt.Errorf("read page state: %w", err)
 	}
-	// Prefer Canva's own page counter. Without it, fall back to the DOM
-	// cluster heuristic, which is only an upper bound — the duplicate-frame
-	// check below stops us early in that case.
+	// A DOM cluster counts mounted nodes, not pages. Canva virtualizes longer
+	// decks, so exporting that estimate can silently truncate a presentation.
 	total := st.Total
-	exact := total > 0
-	if !exact {
-		total = det.Count
-		if total == 0 {
-			total = det.ClusterSize
-		}
+	if total <= 0 {
+		return nil, fmt.Errorf("could not determine Canva page count; no partial PDF was saved")
 	}
-	if exact {
-		fmt.Fprintf(os.Stderr, "deck has %d slide(s)\n", total)
-	} else {
-		fmt.Fprintf(os.Stderr, "deck has up to %d slide(s)\n", total)
-	}
+	fmt.Fprintf(os.Stderr, "deck has %d slide(s)\n", total)
 
 	var slides []adapter.Slide
 	var lastHash [32]byte
@@ -289,31 +318,28 @@ func (a *Adapter) Fetch(ctx context.Context, rawURL string, opts adapter.Options
 			if err := chromedp.Run(bctx, chromedp.KeyEvent(kb.ArrowRight)); err != nil {
 				return nil, fmt.Errorf("advance to slide %d: %w", i, err)
 			}
-			if exact {
-				if err := waitForPage(bctx, i); err != nil {
-					return nil, fmt.Errorf("advance to slide %d: %w", i, err)
-				}
+			if err := waitForPage(bctx, i); err != nil {
+				return nil, fmt.Errorf("advance to slide %d: %w", i, err)
 			}
 		}
 		if err := chromedp.Run(bctx, chromedp.Evaluate(hideOverlaysJS, nil)); err != nil {
 			return nil, err
 		}
+		if err := chromedp.Run(bctx, chromedp.Evaluate(detectPlayerJS, &det)); err != nil {
+			return nil, err
+		}
+		if det == nil || det.W <= 0 || det.H <= 0 {
+			return nil, fmt.Errorf("slide %d vanished; no partial PDF was saved", i)
+		}
+		playerRect := viewportRect{X: det.X, Y: det.Y, W: det.W, H: det.H}
 		shot, err := captureSettled(bctx, playerRect)
 		if err != nil {
 			return nil, fmt.Errorf("screenshot slide %d: %w", i, err)
 		}
 		h := sha256.Sum256(shot)
 		if i > 1 && h == lastHash {
-			if exact {
-				// Canva says there's another page but it rendered
-				// identically to the last one. Most likely a genuinely
-				// duplicated slide; keep it rather than silently dropping
-				// a page the author put there.
-				fmt.Fprintf(os.Stderr, "slide %d looks identical to slide %d; keeping it\n", i, i-1)
-			} else {
-				fmt.Fprintf(os.Stderr, "end of deck after %d slide(s)\n", len(slides))
-				break
-			}
+			// The counter confirmed this page; retain intentional duplicates.
+			fmt.Fprintf(os.Stderr, "slide %d looks identical to slide %d; keeping it\n", i, i-1)
 		}
 		lastHash = h
 		slides = append(slides, adapter.Slide{Data: shot, ContentType: "image/png"})
