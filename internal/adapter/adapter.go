@@ -26,13 +26,34 @@ type PDFFetcher interface {
 	FetchPDF(ctx context.Context, rawURL string, opts Options) ([]byte, error)
 }
 
+// DocumentFetcher chooses a native PDF or rendered slides in one browser session.
+type DocumentFetcher interface {
+	FetchDocument(context.Context, string, Options) (Document, error)
+}
+
+type Document struct {
+	PDF    []byte
+	Slides []Slide
+}
+
 // Options carries CLI-level toggles that an adapter may need to honor.
 type Options struct {
 	Headful bool
 	// Email is used to satisfy email-gated viewers (e.g. docsend prompting
 	// the visitor before showing the deck). May be empty; if it's empty
 	// and a gate is detected, the adapter should return a clear error.
-	Email string
+	Email  string
+	Name   string
+	Fields map[string]string
+	// DocSend and Papermark credential gates.
+	Passcode         string
+	VerificationCode string
+	// VerificationLink is an unopened DocSend authentication email link.
+	VerificationLink string
+	// Called only when a verification gate is reached and no code was supplied.
+	// The browser session stays open while the caller obtains the code.
+	RequestVerificationCode func(context.Context) (string, error)
+	RequestVerificationLink func(context.Context) (string, error)
 }
 
 var (
@@ -57,6 +78,15 @@ func Find(rawURL string) Adapter {
 	}
 	if fallback != nil && fallback.Matches(rawURL) {
 		return fallback
+	}
+	return nil
+}
+
+func FindByName(name string) Adapter {
+	for _, a := range All() {
+		if a.Name() == name {
+			return a
+		}
 	}
 	return nil
 }
