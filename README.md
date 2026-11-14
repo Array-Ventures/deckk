@@ -109,6 +109,10 @@ sessions or return structured JSON.
   Reads the viewer's page counter and checks every page advance, including
   the newer anonymous viewer with a thumbnail strip. If the counter is
   unavailable or navigation stalls, it fails instead of saving a partial deck.
+  Both Canva and Pitch wait for visible HTML/SVG images, backgrounds, fonts,
+  and stable frames, then recheck the current page and total. A resource that
+  fails to load or an animation that never settles stops the export. These
+  bounded checks cannot guarantee arbitrary later script or canvas updates.
   Only works for publicly shared view links (no Canva login).
 - **google-drive** — handles `drive.google.com/file/d/...` links (and the
   older `open?id=` / `uc?id=` forms). Drive doesn't convert anything, it
