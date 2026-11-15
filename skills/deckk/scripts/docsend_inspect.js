@@ -1,7 +1,13 @@
 /* Evaluate this expression in the already-open document tab. It never submits a form. */
 (async () => {
-  const visible = el => !!el && el.getClientRects().length > 0 &&
-    getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none' && Number(getComputedStyle(el).opacity) > 0;
+  const visible = el => {
+    if (!el || !el.getClientRects().length) return false;
+    for (let node = el; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
+    }
+    return true;
+  };
   const excluded = el => !!el.closest('form[id*="feedback" i], form[class*="feedback" i], form[id*="comment" i], form[class*="comment" i], form[id*="doc-chat" i]');
   const first = selector => [...document.querySelectorAll(selector)].find(el => visible(el) && !excluded(el));
   const text = el => (el?.innerText || el?.textContent || '').trim().replace(/\s+/g, ' ');
@@ -51,9 +57,10 @@
       el.matches('a[download],a#downloadButton,button#downloadButton,a.js-download-document,button.js-download-document')));
   const more = [...document.querySelectorAll('button,[role="button"]')].find(el => visible(el) && /^(more|more options|options)$/i.test(el.getAttribute('aria-label') || el.title || text(el)));
 
-  const counterText = [...document.querySelectorAll('[data-page-counter],[class*="page-number"],[class*="page-counter"],[class*="slide-counter"],[aria-live]')]
-    .filter(visible).flatMap(el => (el.innerText || el.textContent || '').split('\n'));
-  counterText.push(...(document.body.innerText || '').split('\n'));
+  const inSlide = el => !!el.closest('[data-page-num],.page-view,.slide,.slide-wrapper') ||
+    [...document.querySelectorAll('img[class*="page-view"]')].some(img => img.parentElement !== document.body && img.parentElement !== document.documentElement && img.parentElement?.contains(el));
+  const counterText = [...document.querySelectorAll('[data-page-counter],[class*="page-number"],[class*="page-counter"],[class*="slide-counter"]')]
+    .filter(el => visible(el) && !inSlide(el)).map(text);
   let counter = null;
   for (const line of counterText) {
     const match = /^\s*(?:(?:page|slide)\s+)?(\d{1,4})\s*(?:\/|of)\s*(\d{1,4})\s*$/i.exec(line);
@@ -64,12 +71,25 @@
     return { ...common, status: download ? 'native-only' : 'unsupported', reason: 'No authoritative page counter between 1 and 300 pages.' };
   }
 
+  const fullyVisible = el => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 200 || r.height < 150 || r.left < 0 || r.top < 0 || r.right > innerWidth + 1 || r.bottom > innerHeight + 1) return false;
+    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent), box = parent.getBoundingClientRect();
+      const clips = axis => /paint|strict|content/.test(style.contain) || /^(hidden|clip|scroll|auto)$/.test(style[axis]);
+      if ((style.clipPath && style.clipPath !== 'none') || (style.maskImage && style.maskImage !== 'none')) return false;
+      const sx = parent.offsetWidth ? box.width / parent.offsetWidth : 1;
+      const sy = parent.offsetHeight ? box.height / parent.offsetHeight : 1;
+      const left = box.left + parent.clientLeft * sx, top = box.top + parent.clientTop * sy;
+      if (clips('overflowX') && (r.left < left - 1 || r.right > left + parent.clientWidth * sx + 1)) return false;
+      if (clips('overflowY') && (r.top < top - 1 || r.bottom > top + parent.clientHeight * sy + 1)) return false;
+    }
+    return true;
+  };
   const candidates = [...document.querySelectorAll('img[class*="page-view"], img, canvas')].filter(el => {
     if (!visible(el) || excluded(el)) return false;
-    const rect = el.getBoundingClientRect();
     const source = (el.currentSrc || el.src || '').toLowerCase();
-    return rect.width >= 200 && rect.height >= 150 && rect.left >= 0 && rect.top >= 0 &&
-      rect.right <= innerWidth + 1 && rect.bottom <= innerHeight + 1 &&
+    return fullyVisible(el) &&
       !/banner|logo|avatar|thumbnail|thumb|icon|powered-by|blank[.]gif/.test(source);
   }).sort((a, b) => {
     const preferred = el => el.matches('img[class*="page-view"]') ? 1 : 0;

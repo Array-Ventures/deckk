@@ -57,9 +57,11 @@ func TestProviderInspectors(t *testing.T) {
 		total                                   float64
 		export                                  string
 	}{
-		{name: "Papermark screenshot", provider: "papermark", html: `<div style="position:relative;width:640px;height:360px">` + slide + `<div style="position:absolute;top:0;color:red">WATERMARK</div></div><div>1 / 3</div>`, status: "ready", total: 3},
-		{name: "Papermark split counter", provider: "papermark", html: `<div style="width:640px;height:360px">` + slide + `</div><div style="display:flex"><span>1</span><span>/</span><span>3</span></div>`, status: "ready", total: 3},
-		{name: "Papermark mismatch", provider: "papermark", html: `<div>` + strings.Replace(slide, "Page 1", "Page 2", 1) + `</div><div>1 / 3</div>`, status: "loading"},
+		{name: "Papermark screenshot", provider: "papermark", html: `<div style="position:relative;width:640px;height:360px">` + slide + `<div style="position:absolute;top:0;color:red">WATERMARK</div></div><div data-page-counter>1 / 3</div>`, status: "ready", total: 3},
+		{name: "Papermark split counter", provider: "papermark", html: `<div style="width:640px;height:360px">` + slide + `</div><nav data-viewer-top-bar><div style="display:flex"><span>1</span><span>/</span><span>3</span></div></nav>`, status: "ready", total: 3},
+		{name: "Papermark application body is not a page wrapper", provider: "papermark", html: slide + `<div data-page-counter>1 / 3</div>`, status: "loading"},
+
+		{name: "Papermark mismatch", provider: "papermark", html: `<div>` + strings.Replace(slide, "Page 1", "Page 2", 1) + `</div><div data-page-counter>1 / 3</div>`, status: "loading"},
 		{name: "Papermark missing total", provider: "papermark", html: `<div>` + slide + `</div>`, status: "unsupported"},
 		{name: "Papermark native single", provider: "papermark", html: `<a download href="/deck.pdf">Download PDF</a>`, status: "native-only"},
 		{name: "Papermark custom fields", provider: "papermark", html: `<form><label>Company<input name="company" required></label><textarea name="reason"></textarea><button>Continue</button></form>`, status: "gate", gate: "credentials"},
@@ -70,15 +72,24 @@ func TestProviderInspectors(t *testing.T) {
 		{name: "Papermark signing", provider: "papermark", html: `<button>Open signing</button>`, status: "gate", gate: "agreement"},
 		{name: "Papermark sent email", provider: "papermark", html: `<h1>Check your inbox</h1>`, status: "gate", gate: "verification-link"},
 		{name: "Pitch DOM SVG", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px"><svg width="640" height="360"><text x="20" y="20">Title</text></svg></div><div class="player-v2-chrome-controls-slide-count">1 / 4</div>`, status: "ready", total: 4},
-		{name: "Pitch clipped", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px;transform:translateX(-50px)">Slide</div><div>1 / 4</div>`, status: "loading"},
+		{name: "Pitch body fraction ignored", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px">1 / 1</div><button aria-label="Next slide">Next</button>`, status: "unsupported"},
+		{name: "Pitch slide counter ignored", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px"><div class="player-v2-chrome-controls-slide-count">1 / 1</div></div>`, status: "unsupported"},
+		{name: "Pitch transparent ancestor", provider: "pitch", html: `<div style="opacity:0"><div class="slide-wrapper" style="width:640px;height:360px">Slide</div></div><div data-page-counter>1 / 3</div>`, status: "loading"},
+
+		{name: "Pitch scaled ancestor clipped", provider: "pitch", html: `<div style="width:2560px;height:400px;overflow:hidden;transform:scale(.25);transform-origin:top left"><div class="slide-wrapper" style="width:2560px;height:800px">Slide</div></div><div data-page-counter>1 / 3</div>`, status: "loading"},
+
+		{name: "Pitch ancestor clipped", provider: "pitch", html: `<div style="width:640px;height:100px;overflow:hidden"><div class="slide-wrapper" style="width:640px;height:360px">Slide</div></div><div data-page-counter>1 / 3</div>`, status: "loading"},
+		{name: "Canva slide counter ignored", provider: "canva", html: `<div data-page-id="0" style="width:640px;height:360px"><button>1 / 1</button></div>`, status: "unsupported"},
+
+		{name: "Pitch clipped", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px;transform:translateX(-50px)">Slide</div><div data-page-counter>1 / 4</div>`, status: "loading"},
 		{name: "Pitch missing total", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px">Slide</div>`, status: "unsupported"},
 		{name: "Pitch native", provider: "pitch", html: `<button aria-label="Download PDF">Export</button>`, status: "native-only"},
-		{name: "Pitch media", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px"><video></video></div><div>1 / 4</div>`, status: "loading"},
+		{name: "Pitch media", provider: "pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px"><video></video></div><div data-page-counter>1 / 4</div>`, status: "loading"},
 		{name: "Canva page", provider: "canva", html: `<div data-page-id="0" style="width:640px;height:360px">Page</div><button>1 / 5</button>`, status: "ready", total: 5},
 		{name: "Canva slider", provider: "canva", html: `<div data-page-id="1" style="width:640px;height:360px">Page</div><div role="slider" aria-label="Page" aria-valuenow="2" aria-valuemax="5">Pages</div>`, status: "ready", total: 5},
 		{name: "Canva mismatch", provider: "canva", html: `<div data-page-id="1" style="width:640px;height:360px">Page</div><button>1 / 5</button>`, status: "loading"},
 		{name: "Canva zoom is not pages", provider: "canva", html: `<div data-page-id="0" style="width:640px;height:360px">Page</div><div role="slider" aria-label="Zoom" aria-valuenow="1" aria-valuemax="5">Zoom</div>`, status: "unsupported"},
-		{name: "Auto-detect Pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px">Slide</div><div>1 / 3</div>`, status: "ready", total: 3, url: "https://pitch.com/v/example"},
+		{name: "Auto-detect Pitch", html: `<div class="slide-wrapper" style="width:640px;height:360px">Slide</div><div data-page-counter>1 / 3</div>`, status: "ready", total: 3, url: "https://pitch.com/v/example"},
 		{name: "Auto-detect Slides", html: `<p>Presentation</p>`, status: "native-only", url: "https://docs.google.com/presentation/d/example_ID/edit", export: "https://docs.google.com/presentation/d/example_ID/export/pdf"},
 		{name: "Unrecognized domain", html: `<p>Not a known viewer</p>`, status: "unsupported", url: "https://example.test/deck"},
 

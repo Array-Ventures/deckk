@@ -10,8 +10,14 @@
     host === 'drive.google.com' ? 'google-drive' : domain('notion.site') || domain('notion.so') ? 'notion' : null;
   const provider = providerHint || inferred;
   const base = { provider, origin: location.origin, documentPath: location.pathname };
-  const visible = el => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden' &&
-    getComputedStyle(el).display !== 'none' && Number(getComputedStyle(el).opacity) > 0;
+  const visible = el => {
+    if (!el || !el.getClientRects().length) return false;
+    for (let node = el; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
+    }
+    return true;
+  };
   const excluded = el => !!el.closest('form[id*="feedback" i],form[class*="feedback" i],form[id*="comment" i],form[class*="comment" i],[role="complementary"]');
   const text = el => (el?.innerText || el?.textContent || '').trim().replace(/\s+/g, ' ');
   const all = selector => [...document.querySelectorAll(selector)].filter(el => visible(el) && !excluded(el));
@@ -86,7 +92,19 @@
   }
   function fullyVisible(el) {
     const r = el.getBoundingClientRect();
-    return visible(el) && r.width >= 200 && r.height >= 100 && r.left >= 0 && r.top >= 0 && r.right <= innerWidth + 1 && r.bottom <= innerHeight + 1;
+    if (!visible(el) || r.width < 200 || r.height < 100 || r.left < 0 || r.top < 0 || r.right > innerWidth + 1 || r.bottom > innerHeight + 1) return false;
+    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent), box = parent.getBoundingClientRect();
+      const paint = /paint|strict|content/.test(style.contain);
+      const clips = axis => paint || /^(hidden|clip|scroll|auto)$/.test(style[axis]);
+      if ((style.clipPath && style.clipPath !== 'none') || (style.maskImage && style.maskImage !== 'none')) return false;
+      const sx = parent.offsetWidth ? box.width / parent.offsetWidth : 1;
+      const sy = parent.offsetHeight ? box.height / parent.offsetHeight : 1;
+      const left = box.left + parent.clientLeft * sx, top = box.top + parent.clientTop * sy;
+      if (clips('overflowX') && (r.left < left - 1 || r.right > left + parent.clientWidth * sx + 1)) return false;
+      if (clips('overflowY') && (r.top < top - 1 || r.bottom > top + parent.clientHeight * sy + 1)) return false;
+    }
+    return true;
   }
   async function digest(value) {
     if (!crypto.subtle) throw new Error('This browser context cannot fingerprint the viewer.');
@@ -94,18 +112,19 @@
     return [...new Uint8Array(bytes)].map(n => n.toString(16).padStart(2, '0')).join('');
   }
   // Counters, rather than the number of mounted slides, prove the deck total.
-  const counters = all('[data-page-counter],[class*="slide-count"],[class*="page-counter"],[aria-live],button,[role="button"]');
+  const inSlide = el => !!el.closest('.slide-wrapper,.slide,.presentation-page,[data-page-id],[data-page-num],.react-pdf__Page,.notion-page-content') ||
+    all('img.viewer-image-mobile,img[alt^="Page "]').some(img => img.parentElement !== document.body && img.parentElement !== document.documentElement && img.parentElement?.contains(el));
+  const counterSelector = provider === 'pitch' ? '.player-v2-chrome-controls-slide-count,[data-page-counter]' :
+    provider === 'papermark' ? '[data-page-counter],[data-viewer-top-bar] div,nav div' :
+    '[data-page-counter],button,[role="button"]';
+  const counters = all(counterSelector).filter(el => !inSlide(el));
   let counter = null;
-  if (provider === 'papermark') {
-    const spans = all('div').filter(el => el.children.length === 3 && [...el.children].every(child => child.tagName === 'SPAN'));
-    counters.unshift(...spans);
-  }
-  for (const line of [...counters.map(text), ...(document.body.innerText || '').split('\n')]) {
-    const match = /^\s*(?:(?:page|slide)\s+)?(\d{1,4})\s*(?:\/|of)\s*(\d{1,4})\s*$/i.exec(line);
+  for (const el of counters) {
+    const match = /^\s*(?:(?:page|slide)\s+)?(\d{1,4})\s*(?:\/|of)\s*(\d{1,4})\s*$/i.exec(text(el));
     if (match) { counter = { index: Number(match[1]), total: Number(match[2]) }; break; }
   }
   if (provider === 'canva') {
-    const slider = all('[role="slider"]').find(el => /page/i.test(el.getAttribute('aria-label') || ''));
+    const slider = all('[role="slider"]').filter(el => !inSlide(el)).find(el => /page/i.test(el.getAttribute('aria-label') || ''));
     if (slider) counter = { index: Number(slider.getAttribute('aria-valuenow')), total: Number(slider.getAttribute('aria-valuemax')) };
   }
   let slide;
@@ -121,6 +140,7 @@
     content = all('img.viewer-image-mobile,img[alt^="Page "],.react-pdf__Page canvas').filter(fullyVisible).sort((a,b) => b.getBoundingClientRect().width*b.getBoundingClientRect().height-a.getBoundingClientRect().width*a.getBoundingClientRect().height)[0];
     // The immediate wrapper includes Papermark's watermark and media overlays.
     slide = content?.parentElement;
+    if (slide === document.body || slide === document.documentElement) slide = null;
     if (content && /blank\.gif(?:\?|$)/i.test(content.currentSrc || content.src || '')) slide = null;
     const number = content && /^Page (\d+)$/i.exec(content.alt || '');
     if (number && counter && Number(number[1]) !== counter.index) return { ...common, ...counter, status: 'loading', reason: 'Papermark page and counter disagree.' };
