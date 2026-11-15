@@ -73,18 +73,22 @@ deckk --email you@example.com --passcode 'your-passcode' --timeout 10m https://d
 
 ## Agent skill
 
-The bundled [deckk skill](skills/deckk/SKILL.md) teaches an agent to invoke the
-CLI, handle access gates, check the saved PDF, and return the file through its
-host's attachment or download facility.
+The bundled [deckk skill](skills/deckk/SKILL.md) uses the agent host's existing
+browser tools for DocSend, Papermark, Pitch, Canva, Google Slides, Drive, Notion
+and direct PDFs. It prefers native downloads and otherwise assembles verified
+rendered captures in the agent workspace. It needs browser evaluation,
+screenshots and downloads plus Python 3.11 and the bundled requirements for
+PDF validation/assembly. Go, the CLI and a second browser are not required.
 
-Copy `skills/deckk` into your agent's skills directory (for Codex,
-`~/.codex/skills/deckk`) and put the CLI on its `PATH`. Build the CLI from this
-checkout to use the DocSend and Papermark credential and verification additions.
-Homebrew and `go install` install only the binary; copy the skill separately.
+Install `skills/deckk` as a complete skill bundle, including its scripts and
+references. For example, copy that folder into `~/.codex/skills/deckk`, or use
+a host's GitHub skill importer. Importing does not install Python packages or
+grant browser permissions. Read the provider-specific references on demand.
 
-Verification codes need an execution tool that can keep an interactive
-process open while the user retrieves the code. The CLI does not yet persist
-sessions or return structured JSON.
+See the [coverage matrix](skills/deckk/references/coverage.md) for tested paths
+and live-service gaps. The CLI remains available separately; its historical
+live tests do not establish browser-skill compatibility.
+
 
 ## Adapters
 
