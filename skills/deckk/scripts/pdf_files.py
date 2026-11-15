@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -87,6 +88,65 @@ def assemble(manifest_path, output):
         if image_info(image_path)['pixelHash'] != page.get('stablePixelHash'):
             raise ValueError(f'Page {index} pixels do not match the stable capture')
         images.append(image_path)
+    return publish([(path, None) for path in images], output)
+
+
+def assemble_scroll(manifest_path, output):
+    """Validate ordered overlapping viewport captures, cropping overlap and footer padding."""
+    manifest_path = Path(manifest_path).resolve()
+    segments = json.loads(manifest_path.read_text()).get('segments')
+    if not isinstance(segments, list) or not 1 <= len(segments) <= 300:
+        raise ValueError('Scroll manifest needs 1 to 300 segments')
+    identity = None
+    height = None
+    covered = 0
+    dimensions = None
+    images = []
+    for segment in segments:
+        before, after = segment['before'], segment['after']
+        for key in ('origin', 'documentPath', 'contentHeight', 'viewportHeight', 'offset', 'fingerprint'):
+            if before.get(key) != after.get(key):
+                raise ValueError('Document moved or changed during a scroll capture')
+        if before.get('status') != 'scroll-ready' or after.get('status') != 'scroll-ready' or before.get('collapsed') or after.get('collapsed'):
+            raise ValueError('Scroll capture is not ready or has collapsed content')
+        current = (before.get('origin'), before.get('documentPath'))
+        if not all(isinstance(value, str) and value for value in current) or not before.get('fingerprint'):
+            raise ValueError('Missing scroll document identity or fingerprint')
+        if identity is not None and current != identity:
+            raise ValueError('Scroll document changed')
+        identity = current
+        offset, viewport, current_height = (before.get(key) for key in ('offset', 'viewportHeight', 'contentHeight'))
+        if not all(type(value) in (int, float) and math.isfinite(value) for value in (offset, viewport, current_height)):
+            raise ValueError('Invalid scroll dimensions')
+        if not 0 <= offset < current_height <= 40000 or viewport < 100:
+            raise ValueError('Scroll dimensions are outside the supported range')
+        if height is not None and abs(height - current_height) > 0.5:
+            raise ValueError('Scroll document height changed; restart the capture')
+        height = current_height
+        if offset > covered + 1e-6 or offset + viewport <= covered:
+            raise ValueError('Scroll captures have a gap or make no progress')
+        if covered == 0 and offset != 0:
+            raise ValueError('Scroll capture must start at the document top')
+        image_path = manifest_path.parent / segment['image']
+        if image_info(image_path)['pixelHash'] != segment.get('stablePixelHash'):
+            raise ValueError('Scroll capture pixels changed')
+        image = pixels(image_path)
+        scale = image.height / viewport
+        if dimensions is not None and (image.width != dimensions[0] or abs(scale - dimensions[1]) > 0.001):
+            raise ValueError('Scroll capture width or pixel scale changed')
+        dimensions = (image.width, scale)
+        top = round((covered - offset) * scale)
+        bottom = round((min(height, offset + viewport) - offset) * scale)
+        if bottom <= top:
+            raise ValueError('Scroll capture has no new pixels')
+        images.append((image_path, (0, top, image.width, bottom)))
+        covered = min(height, offset + viewport)
+    if height is None or covered < height - 0.5 or not segments[-1]['after'].get('atEnd'):
+        raise ValueError('Scroll capture did not reach the document end')
+    return publish(images, output)
+
+
+def publish(images, output):
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
@@ -95,16 +155,18 @@ def assemble(manifest_path, output):
     os.close(descriptor)
     try:
         pdf = canvas.Canvas(temporary, pageCompression=1)
-        for path in images:
+        for path, crop in images:
             image = pixels(path)
+            if crop is not None:
+                image = image.crop(crop)
             pdf.setPageSize(image.size)
             pdf.drawImage(ImageReader(image), 0, 0, width=image.width, height=image.height)
             pdf.showPage()
         pdf.save()
-        inspect_pdf(temporary, count)
+        inspect_pdf(temporary, len(images))
         # Exclusive publication prevents replacing an existing user file, including races.
         os.link(temporary, output)
-        return inspect_pdf(output, count)
+        return inspect_pdf(output, len(images))
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -120,12 +182,17 @@ def main():
     build = commands.add_parser('assemble')
     build.add_argument('manifest')
     build.add_argument('output')
+    scroll = commands.add_parser('assemble-scroll')
+    scroll.add_argument('manifest')
+    scroll.add_argument('output')
     args = parser.parse_args()
     try:
         if args.command == 'image-info':
             result = [image_info(path) for path in args.images]
         elif args.command == 'inspect':
             result = inspect_pdf(args.pdf, args.expected_pages)
+        elif args.command == 'assemble-scroll':
+            result = assemble_scroll(args.manifest, args.output)
         else:
             result = assemble(args.manifest, args.output)
     except (OSError, ValueError, KeyError, TypeError) as error:

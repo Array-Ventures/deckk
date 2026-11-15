@@ -98,5 +98,71 @@ class CapturePDFTests(unittest.TestCase):
         self.assertEqual(self.build()['pages'], 3)
 
 
+class ScrollPDFTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.document = Image.new('RGB', (400, 900))
+        for y in range(900):
+            for x in range(400):
+                self.document.putpixel((x, y), (y % 256, (y // 3) % 256, x % 256))
+        self.manifest = {'segments': []}
+        for index, offset in enumerate((0, 300)):
+            image = self.document.crop((0, offset, 400, offset + 600))
+            path = self.root / f'{index}.png'
+            image.save(path)
+            state = {'status': 'scroll-ready', 'origin': 'https://example.test',
+                     'documentPath': '/notion', 'offset': offset, 'viewportHeight': 600,
+                     'contentHeight': 900, 'fingerprint': f'strip-{index}',
+                     'collapsed': 0, 'atEnd': index == 1}
+            self.manifest['segments'].append({'image': path.name, 'before': dict(state),
+                'after': dict(state), 'stablePixelHash': pdf.image_info(path)['pixelHash']})
+
+    def build(self, manifest=None):
+        path = self.root / 'scroll.json'
+        path.write_text(json.dumps(manifest or self.manifest))
+        return pdf.assemble_scroll(path, self.root / 'scroll.pdf')
+
+    def test_overlap_is_cropped_and_embedded_pixels_cover_document_once(self):
+        result = self.build()
+        reader = PdfReader(result['path'])
+        self.assertEqual(result['pages'], 2)
+        self.assertEqual([float(page.mediabox.height) for page in reader.pages], [600, 300])
+        images = [page.images[0].image.convert('RGB') for page in reader.pages]
+        joined = Image.new('RGB', (400, 900))
+        joined.paste(images[0], (0, 0))
+        joined.paste(images[1], (0, 600))
+        self.assertEqual(joined.tobytes(), self.document.tobytes())
+
+    def test_incomplete_gap_height_change_movement_and_collapsed_rejected(self):
+        cases = []
+        incomplete = copy.deepcopy(self.manifest)
+        incomplete['segments'].pop()
+        cases.append(incomplete)
+        for key, value in [('offset', 650), ('contentHeight', 950), ('collapsed', 1)]:
+            changed = copy.deepcopy(self.manifest)
+            changed['segments'][1]['before'][key] = value
+            changed['segments'][1]['after'][key] = value
+            cases.append(changed)
+        moved = copy.deepcopy(self.manifest)
+        moved['segments'][0]['after']['offset'] = 1
+        cases.append(moved)
+        for manifest in cases:
+            with self.subTest(manifest=manifest), self.assertRaises(ValueError):
+                self.build(manifest)
+            self.assertFalse((self.root / 'scroll.pdf').exists())
+
+    def test_nonfinite_dimensions_and_changed_pixels_rejected(self):
+        invalid = copy.deepcopy(self.manifest)
+        invalid['segments'][0]['before']['contentHeight'] = float('inf')
+        invalid['segments'][0]['after']['contentHeight'] = float('inf')
+        with self.assertRaises(ValueError):
+            self.build(invalid)
+        Image.new('RGB', (400, 600), 'black').save(self.root / '0.png')
+        with self.assertRaisesRegex(ValueError, 'pixels'):
+            self.build()
+
+
 if __name__ == '__main__':
     unittest.main()
